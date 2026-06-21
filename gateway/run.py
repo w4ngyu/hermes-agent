@@ -6219,6 +6219,131 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform.value, attempt,
                 )
 
+                # Refresh runtime env before recreating the adapter.
+                #
+                # Background: hermes_cli.config.reload_env() unconditionally
+                # `del os.environ[key]` for every Hermes-known var it can't
+                # re-read from .env on a given tick. A transient .env read
+                # failure (file lock, IO blip, parse error) therefore empties
+                # BLUEBUBBLES_SERVER_URL / _PASSWORD / TELEGRAM_BOT_TOKEN /
+                # etc. from os.environ — even though .env itself is fine.
+                # Adapters that read os.getenv(...) at __init__ then connect()
+                # with empty strings and log "<VAR> is required" forever,
+                # every 5 minutes, until the gateway is restarted.
+                #
+                # Re-running the same env loader the startup pass uses fixes
+                # it without a restart. See HANDOVER-hermes-reconnect-env-fix.md
+                # under ~/.hermes/ for the full postmortem.
+                _reload_runtime_env_preserving_config_authority()
+
+                # Defensive second pass: also re-apply env overrides to
+                # platform_config.extra. The BlueBubbles adapter's __init__
+                # reads `extra.get("server_url") or os.getenv(...)` — if
+                # `extra` is populated, the `or` short-circuits and the
+                # os.getenv fallback is never consulted, so a successful
+                # os.environ reload above is not enough by itself. Re-running
+                # the same _apply_env_overrides() that startup uses repopulates
+                # extra from the (now refreshed) os.environ. Without this,
+                # the housekeeping reconnect path can hit a PlatformConfig
+                # whose `extra` was emptied by a config-reload step elsewhere
+                # in the runtime.
+                from gateway.config import _apply_env_overrides, GatewayConfig
+                _apply_env_overrides(
+                    GatewayConfig(platforms={platform: platform_config})
+                )
+
+                # Race-proof last resort: re-read .env directly into
+                # platform_config.extra, bypassing os.environ. The
+                # reload_env() helper is called 107+ places in the codebase
+                # (see hermes_cli/config.py:6342-6346 — it `del`s known keys
+                # when a transient .env read fails), and even an immediate
+                # prior call to _apply_env_overrides() can be wiped out by a
+                # concurrent reload_env() running on a different thread or
+                # event-loop tick. Reading the file synchronously here and
+                # writing into platform_config.extra — which is a plain
+                # Python dict that only we touch — gives us a value that
+                # cannot be removed by anything else before _create_adapter
+                # consumes it one line later.
+                try:
+                    _env_path = _hermes_home / ".env"
+                    if _env_path.exists():
+                        _env_map: Dict[str, str] = {}
+                        with open(_env_path, encoding="utf-8") as _ef:
+                            for _line in _ef:
+                                _stripped = _line.strip()
+                                if (
+                                    not _stripped
+                                    or _stripped.startswith("#")
+                                    or "=" not in _stripped
+                                ):
+                                    continue
+                                _ek, _, _ev = _stripped.partition("=")
+                                _env_map[_ek.strip()] = _ev.strip().strip('"').strip("'")
+                        # Platform-specific extra key mapping. Add more
+                        # platforms here as they show the same symptom.
+                        _EXTRA_KEY_MAP: Dict[str, Dict[str, str]] = {
+                            "bluebubbles": {
+                                "BLUEBUBBLES_SERVER_URL": "server_url",
+                                "BLUEBUBBLES_PASSWORD": "password",
+                                "BLUEBUBBLES_WEBHOOK_HOST": "webhook_host",
+                                "BLUEBUBBLES_WEBHOOK_PORT": "webhook_port",
+                                "BLUEBUBBLES_WEBHOOK_PATH": "webhook_path",
+                                "BLUEBUBBLES_SEND_READ_RECEIPTS": "send_read_receipts",
+                            },
+                        }
+                        _platform_name = platform.value
+                        _env_to_extra = _EXTRA_KEY_MAP.get(_platform_name, {})
+                        for _ek, _xk in _env_to_extra.items():
+                            if _ek in _env_map:
+                                _v = _env_map[_ek]
+                                # int cast for ports
+                                if _xk in ("webhook_port",):
+                                    try:
+                                        _v = str(int(_v))
+                                    except ValueError:
+                                        continue
+                                # bool cast for *_SEND_READ_RECEIPTS
+                                elif _xk in ("send_read_receipts",):
+                                    _v = _v.lower() in {"true", "1", "yes"}
+                                # rstrip("/") for server_url
+                                elif _xk == "server_url":
+                                    _v = _v.rstrip("/")
+                                # Always overwrite: .env is the source of truth.
+                                # _apply_env_overrides() above may have written
+                                # empty strings into extra when its os.getenv
+                                # fallback raced with a concurrent reload_env(),
+                                # and a non-empty-but-wrong cached value would
+                                # be just as bad. The .env file is the only
+                                # thing we can read synchronously and trust
+                                # for the duration of this one _create_adapter
+                                # call.
+                                platform_config.extra[_xk] = _v
+                        # [DIAG-TEMP] dump extra + env state so we can see
+                        # what BlueBubblesAdapter.__init__ is actually going
+                        # to consume. Will be removed once the bug is located.
+                        logger.warning(
+                            "[RECONNECT-ENV-DIAG] platform=%s "
+                            "extra_keys=%s server_url=%r password_set=%s "
+                            "os_url=%s os_pwd=%s",
+                            platform.value,
+                            sorted((platform_config.extra or {}).keys()),
+                            platform_config.extra.get("server_url", ""),
+                            bool(platform_config.extra.get("password")),
+                            bool(os.getenv("BLUEBUBBLES_SERVER_URL")),
+                            bool(os.getenv("BLUEBUBBLES_PASSWORD")),
+                        )
+                        # Also seed os.environ with platform-prefixed keys so
+                        # adapters that read os.getenv() in __init__ get them
+                        # for this iteration (best-effort, no race protection
+                        # here — extra is the source of truth, this is for
+                        # adapters that bypass extra).
+                        _prefix = _platform_name.upper() + "_"
+                        for _ek, _ev in _env_map.items():
+                            if _ek.startswith(_prefix):
+                                os.environ[_ek] = _ev
+                except Exception as _env_err:
+                    logger.debug("env-repair (direct file read) failed: %s", _env_err)
+
                 adapter = None
                 try:
                     adapter = self._create_adapter(platform, platform_config)
